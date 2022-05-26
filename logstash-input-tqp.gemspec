@@ -1,5 +1,5 @@
 Gem::Specification.new do |s|
-  s.name            = 'logstash-input-sqs'
+  s.name            = 'logstash-input-tqp'
   s.version         = '3.3.2'
   s.licenses        = ['Apache-2.0']
   s.summary         = "Pulls events from an Amazon Web Services Simple Queue Service queue"

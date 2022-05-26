@@ -1,5 +1,6 @@
 # encoding: utf-8
 #
+require 'json'
 require "logstash/inputs/threadable"
 require "logstash/namespace"
 require "logstash/timestamp"
@@ -12,6 +13,67 @@ require 'logstash/inputs/sqs/patch'
 # It is recommended that this is called prior to launching threads. See
 # https://aws.amazon.com/blogs/developer/threading-with-the-aws-sdk-for-ruby/.
 Aws.eager_autoload!
+
+
+def create_queue_raw(sqs_client, queue_name, attributes, tags)
+  sqs_resource = Aws::SQS::Resource.new(client: sqs_client)
+
+  return sqs_resource.create_queue(
+      queue_name: name, 
+      attributes: attributes, 
+      tags: tags,
+  )
+
+rescue Aws::SQS::Errors::QueueNameExists
+  sqs_resource = Aws::SQS::Resource.new(client: sqs_client)
+
+  queue_url = sqs_client.get_queue_url(queue_name: name).queue_url
+
+  existing_tags = sqs_client.list_queue_tags(queue_url: queue_url).tags
+
+  tags_to_remove = existing_tags.keys - tags.keys
+
+  sqs_client.tag_queue(queue_url: queue_url, tags: tags)
+
+  if tags_to_remove
+      sqs_client.untag_queue(queue_url: queue_url, tag_keys: tags_to_remove)
+  end
+
+  # Run create again to make sure everything matches.
+  return sqs_resource.create_queue(
+      queue_name: name, 
+      attributes: attributes, 
+      tags: tags,
+  )
+end
+
+
+def create_queue(sqs_client, queue_name, tags, **kwargs) 
+
+  dead_letter_queue = _create_queue_raw(
+      sqs_client,
+      "#{queue_name}-dead-letter",
+      {"MessageRetentionPeriod": 1209600},  # maximum (14 days)
+      {"dlq": "true", **tags},
+  )
+  dead_letter_queue_arn = dead_letter_queue.attributes["QueueArn"]
+
+  redrive_policy_kwargs = kwargs.delete("RedrivePolicy") or {}
+
+  return create_queue_raw(
+      queue_name: name, 
+      attributes: {
+        RedrivePolicy: {
+            maxReceiveCoun: 5,
+            **redrive_policy_kwargs ,
+            deadLetterTargetArn: dead_letter_queue_arn,
+        },
+        **kwargs,
+      }, 
+      tags: tags,
+  )
+end
+
 
 # Pull events from an Amazon Web Services Simple Queue Service (SQS) queue.
 #
@@ -65,7 +127,7 @@ Aws.eager_autoload!
 #
 # See http://aws.amazon.com/iam/ for more details on setting up AWS identities.
 #
-class LogStash::Inputs::SQS < LogStash::Inputs::Threadable
+class LogStash::Inputs::TQP < LogStash::Inputs::Threadable
   include LogStash::PluginMixins::AwsConfig::V2
 
   MAX_TIME_BEFORE_GIVING_UP = 60
@@ -76,26 +138,14 @@ class LogStash::Inputs::SQS < LogStash::Inputs::Threadable
   BACKOFF_FACTOR = 2
   DEFAULT_POLLING_FREQUENCY = 20
 
-  config_name "sqs"
+  config_name "tqp"
 
   default :codec, "json"
 
   config :additional_settings, :validate => :hash, :default => {}
 
-  # Name of the SQS Queue name to pull messages from. Note that this is just the name of the queue, not the URL or ARN.
-  config :queue, :validate => :string, :required => true
-
-  # Account ID of the AWS account which owns the queue.
-  config :queue_owner_aws_account_id, :validate => :string, :required => false
-
-  # Name of the event field in which to store the SQS message ID
-  config :id_field, :validate => :string
-
-  # Name of the event field in which to store the SQS message MD5 checksum
-  config :md5_field, :validate => :string
-
-  # Name of the event field in which to store the SQS message Sent Timestamp
-  config :sent_timestamp_field, :validate => :string
+  config :prefix, :validate => :string
+  config :topics, :validate => :string, :list => true
 
   # Polling frequency, default is 20 seconds
   config :polling_frequency, :validate => :number, :default => DEFAULT_POLLING_FREQUENCY
@@ -104,22 +154,22 @@ class LogStash::Inputs::SQS < LogStash::Inputs::Threadable
 
   def register
     require "aws-sdk"
-    @logger.info("Registering SQS input", :queue => @queue, :queue_owner_aws_account_id => @queue_owner_aws_account_id)
+    @logger.info("Registering SQS input", 
+      queue: @queue, 
+      queue_owner_aws_account_id: @queue_owner_aws_account_id
+    )
 
     setup_queue
   end
 
-  def queue_url(aws_sqs_client)
-    if @queue_owner_aws_account_id
-      return aws_sqs_client.get_queue_url({:queue_name => @queue, :queue_owner_aws_account_id => @queue_owner_aws_account_id})[:queue_url]
-    else
-      return aws_sqs_client.get_queue_url(:queue_name => @queue)[:queue_url]
-    end
-  end
-
   def setup_queue
-    aws_sqs_client = Aws::SQS::Client.new(aws_options_hash || {})
-    poller = Aws::SQS::QueuePoller.new(queue_url(aws_sqs_client), :client => aws_sqs_client)
+    sqs_client = Aws::SQS::Client.new()
+    
+    @queue = create_queue(sqs_client, "#{prefix}--#{queue_name}" )
+
+    sqs_client.top
+
+    poller = Aws::SQS::QueuePoller.new(@queue.url, client: sqs_client)
     poller.before_request { |stats| throw :stop_polling if stop? }
 
     @poller = poller
@@ -127,6 +177,43 @@ class LogStash::Inputs::SQS < LogStash::Inputs::Threadable
     @logger.error("Cannot establish connection to Amazon SQS", exception_details(e))
     raise LogStash::ConfigurationError, "Verify the SQS queue name and your credentials"
   end
+
+  def subscribe_to_topics(sqs_client)
+    sns_client = Aws::SNS::Resource.new()
+
+    queue_arn = @queue.attributes["QueueArn"]
+
+    topic_arns = []
+
+    :topics.each do |topic|
+      topic = "#{topic[0]}--#{topic[1]}" if topic.kind_of?(Array)
+
+
+      topic = sns.create_topic(name: "#{:prefix}--#{topic}")
+      topic.subscribe(protocol: "sqs", endpoint: queue_arn)
+
+      topic_arns.push(topic.arn)
+    end
+
+    queue.set_attributes(
+      attributes: {
+        Policy: {
+          Version: "2012-10-17", 
+          Statement: [
+              {
+                Sid: "sns",
+                Effect: "Allow",
+                Principal: {AWS: "*"},
+                Action: "SQS:SendMessage",
+                Resource: queue_arn,
+                Condition: {ArnEquals: {aws:SourceArn: topic_arns}},
+            }
+          ]
+        }
+      }
+    )
+
+  end 
 
   def polling_options
     { 
@@ -136,12 +223,19 @@ class LogStash::Inputs::SQS < LogStash::Inputs::Threadable
     }
   end
 
-  def add_sqs_data(event, message)
-    event.set(@id_field, message.message_id) if @id_field
-    event.set(@md5_field, message.md5_of_body) if @md5_field
-    event.set(@sent_timestamp_field, convert_epoch_to_timestamp(message.attributes[SENT_TIMESTAMP])) if @sent_timestamp_field
-    event
-  end
+  def add_sns_data(self, body, event):
+    topic = body["TopicArn"].split(":")[-1]
+
+    topic = topic.slice!("#{:prefix}--") if :prefix
+
+    message = body.delete("Message")
+
+    event.set('[@metadata][topic]', topic)
+    
+    message.each do |key, value| 
+      event.set(key, value)
+    end
+  end 
 
   def handle_message(message, output_queue)
     @codec.decode(message.body) do |event|
@@ -152,15 +246,22 @@ class LogStash::Inputs::SQS < LogStash::Inputs::Threadable
   end
 
   def run(output_queue)
-    @logger.debug("Polling SQS queue", :polling_options => polling_options)
+    @logger.debug("Polling SQS queue", polling_options: polling_options)
 
     run_with_backoff do
       poller.poll(polling_options) do |messages, stats|
         break if stop?
-        messages.each {|message| handle_message(message, output_queue) }
-        @logger.debug("SQS Stats:", :request_count => stats.request_count,
-                      :received_message_count => stats.received_message_count,
-                      :last_message_received_at => stats.last_message_received_at) if @logger.debug?
+        
+        messages.each {|message| 
+          handle_message(message, output_queue) 
+        }
+
+        @logger.debug(
+          "SQS Stats:", 
+          request_count: stats.request_count,
+          received_message_count: stats.received_message_count,
+          last_message_received_at: stats.last_message_received_at
+        ) if @logger.debug?
       end
     end
   end
@@ -200,4 +301,4 @@ class LogStash::Inputs::SQS < LogStash::Inputs::Threadable
     details
   end
 
-end # class LogStash::Inputs::SQS
+end # class LogStash::Inputs::TQP
